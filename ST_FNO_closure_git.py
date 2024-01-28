@@ -4,13 +4,14 @@ from torch.autograd import grad
 from torch.optim import Adam
 from torch.utils.data import DataLoader, Dataset, TensorDataset
 from torch.optim.lr_scheduler import ExponentialLR
-import numpy as np
 from pinnutils_git import *
 from scipy.interpolate import griddata
 from itertools import product, combinations
 from scipy.io import savemat, loadmat
 from torch.optim.lr_scheduler import ExponentialLR, MultiStepLR
 from tqdm import tqdm_notebook as tqdm 
+import torch.nn as nn
+import torch.nn.functional as F
 
 import scipy.io as sio
 import matplotlib.pyplot as plt
@@ -18,61 +19,46 @@ import matplotlib.pyplot as plt
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(device)
 
+def return_agg(X_test):
+    ## input shape: # channels, [NxN], time snaps
+    imgs  = torch.stack([img_t for img_t in X_test], dim=3)
+    print(" imgs shape ", imgs.shape, " X_test shape ", X_test.shape,  imgs.view(X_test.shape[1],-1).shape)
+    means = imgs.view(X_test.shape[1],-1).mean(dim=1)
+    stds  = imgs.view(X_test.shape[1],-1).std(dim=1)
+    return means, stds
+
 L = np.double(sys.argv[1]); 
 zeta = np.double(sys.argv[2]);
 N = 256;
-
-class DNN(nn.Module):
-    
-    def __init__(self, sizes, mean=0, std=1, seed=0, activation=nn.Tanh()):
-        super(DNN, self).__init__()
-        
-        np.random.seed(seed)
-        torch.manual_seed(seed)
-        
-        self.bn = BatchNorm(mean, std)
-        
-        layer = []
-        for i in range(len(sizes)-2):
-            linear = LayerNoWN(sizes[i], sizes[i+1], seed, activation)
-            layer += [linear, activation]
-            
-        layer += [LayerNoWN(sizes[-2], sizes[-1], seed, activation)]
-        
-        self.net = nn.Sequential(*layer)
-        
-    def forward(self, x):
-        return self.net(self.bn(x))
-
 
 def train_model(zeta, model, criterion, optimizer, scheduler, n_epochs, batch_s, loader, scheduler_flag=True):
     
     model.train();
     
-    vec = np.zeros((batch_s,3))
-    vec[:,0] = 1; vec[:,1] = 0; vec[:,2] = 1;
+    vec = np.zeros((batch_s,3,N,N))
+    vec[:,0,:,:] = 1; vec[:,1,:,:] = 0; vec[:,2,:,:] = 1;
     torch_vec = torch.tensor(vec, dtype=torch.float32).to(device)
     
     start_time = time.time()
-    for epoch in range(n_epochs):
+    for epoch in range(0, n_epochs+1):
+        # monitor training loss
         train_loss = 0.0
-        
-        for i, (X_batch, Y_batch) in enumerate(loader):
-            optimizer.zero_grad()
-            X_batch = X_batch.to(device).requires_grad_(True)
-            Y_batch = Y_batch.to(device)
-            outputs = model(X_batch)
-            
-            # print(" outputs shape ", outputs.shape)
-            # print(" Y_batch shape ", Y_batch[:,0:3].shape, Y_batch[:,3:6].shape)
-            # print(" torch_vec shape ", torch_vec.shape)
-            
-            pred = (outputs[:,2:3] + 2*zeta*outputs[:,0:1])*torch_vec + \
-                   (outputs[:,3:4] + 2*zeta*outputs[:,1:2])*Y_batch[:,0:3] + \
-                    outputs[:,4:5]*Y_batch[:,3:6]
 
-            loss = criterion(pred, Y_batch[:,6:9])
-        
+        for i, (x_batch, y_batch) in enumerate(loader):
+            optimizer.zero_grad()
+            x_batch = x_batch.to(device).requires_grad_(True)
+            y_batch = y_batch.to(device)
+            outputs = model(x_batch)
+            #print(" outputs shape ", outputs.shape)
+            
+            beta0 = outputs[:,0,:,:].reshape(batch_s,1,N,N)
+            beta1 = outputs[:,1,:,:].reshape(batch_s,1,N,N)
+            alpha0 = outputs[:,2,:,:].reshape(batch_s,1,N,N)
+            alpha1 = outputs[:,3,:,:].reshape(batch_s,1,N,N)
+            alpha2 = outputs[:,4,:,:].reshape(batch_s,1,N,N)
+            pred = (alpha0 + 2*zeta*beta0)*torch_vec + (alpha1 + 2*zeta*beta1)*y_batch[:,0:3,:,:] + alpha2*y_batch[:,3:6,:,:]
+            
+            loss = criterion(pred, y_batch[:,6:9,:,:])
             loss.backward()
             optimizer.step()
             
@@ -85,7 +71,7 @@ def train_model(zeta, model, criterion, optimizer, scheduler, n_epochs, batch_s,
                 ))
         
         if(epoch % 10000 == 0):
-            model_name = "Closure_MLP_L_{}_zeta{}_ns{}_ep{}_sin.pth".format(L, zeta, n_samples, epoch)
+            model_name = "Closure_FNO_L_{}_zeta{}_ep{}_sin.pth".format(L, zeta,epoch)
             torch.save({
                 "epoch": epoch,
                 "lr": scheduler.get_last_lr()[0],
@@ -103,7 +89,7 @@ def train_model(zeta, model, criterion, optimizer, scheduler, n_epochs, batch_s,
     
     return model
 
-def evaluate_STCNN(model, device, L, zeta, load_seed, full=True):
+def evaluate_STFNO(model, device, L, zeta, load_seed, full=True):
     
     model.to(device='cpu')
     model.eval();
@@ -125,20 +111,27 @@ def evaluate_STCNN(model, device, L, zeta, load_seed, full=True):
     trace_EE = EE[:,0,:,:] + EE[:,2,:,:];
     trace_DE =  D[:,0,:,:]*E[:,0,:,:] + 2*D[:,1,:,:]*E[:,1,:,:] + D[:,2,:,:]*E[:,2,:,:]
     
-    d11 = D[:,0,:,:].ravel();    d12 = D[:,1,:,:].ravel();   d22 = D[:,2,:,:].ravel();
-    e11 = E[:,0,:,:].ravel();    e12 = E[:,1,:,:].ravel();   e22 = E[:,2,:,:].ravel();
+    trace_DD = trace_DD.reshape(n_snaps,1,N,N)
+    trace_EE = trace_EE.reshape(n_snaps,1,N,N)
+    trace_DE = trace_DE.reshape(n_snaps,1,N,N)
     
-    ST  = SE + 2*zeta*SD
-    se11 = SE[:,0,:,:].ravel(); se12 = SE[:,1,:,:].ravel(); se22 = SE[:,2,:,:].ravel();
-    st11 = ST[:,0,:,:].ravel(); st12 = ST[:,1,:,:].ravel(); st22 = ST[:,2,:,:].ravel();
-
-    X = np.vstack([trace_DD.ravel(), trace_EE.ravel(), trace_DE.ravel()]).T
-    Y = np.vstack([d11, d12, d22, e11, e12, e22, st11, st12, st22]).T 
-    y_test = Y; 
+    # input: D (# snaps x #channels x N x N); trDD (# snaps x N x N); SD (# snaps x # channels x N x N)
+    X_eval = torch.tensor(np.hstack([trace_DD, trace_EE, trace_DE]), dtype=torch.float32)
+    ST      = SE + 2*zeta*SD
+    y_eval = torch.tensor(np.hstack([D, E, ST]), dtype=torch.float32)
     
-    X_test = torch.tensor(X, dtype=torch.float32)
-    # y_test = torch.tensor(Y, dtype=torch.float32)
-    print(" X_test shape ", X_test.shape, " y_test shape ", y_test.shape)
+    output_eval = model(X_eval) #.cpu().data.numpy();
+    beta0      = output_eval[:,0,:,:].reshape(n_snaps,N,N);
+    beta1      = output_eval[:,1,:,:].reshape(n_snaps,N,N);
+    alpha0     = output_eval[:,2,:,:].reshape(n_snaps,N,N);
+    alpha1     = output_eval[:,3,:,:].reshape(n_snaps,N,N);
+    alpha2     = output_eval[:,4,:,:].reshape(n_snaps,N,N);
+    
+    print(y_eval[:,0,:,:].shape, alpha0.shape, alpha1.shape)
+    
+    recon_st11        = ((alpha0 + 2*zeta*beta0)*1 + (alpha1 + 2*zeta*beta1)*y_eval[:,0,:,:] + alpha2*y_eval[:,3,:,:]).cpu().data.numpy();
+    recon_st12        = ((alpha0 + 2*zeta*beta0)*0 + (alpha1 + 2*zeta*beta1)*y_eval[:,1,:,:] + alpha2*y_eval[:,4,:,:]).cpu().data.numpy();
+    recon_st22        = ((alpha0 + 2*zeta*beta0)*1 + (alpha1 + 2*zeta*beta1)*y_eval[:,2,:,:] + alpha2*y_eval[:,5,:,:]).cpu().data.numpy();
     
     if(full):  
         rmse_st = np.zeros((3,))
@@ -150,28 +143,40 @@ def evaluate_STCNN(model, device, L, zeta, load_seed, full=True):
     else:
         rmse_st = np.zeros((n_snaps, 3))
         for k in range(0, n_snaps):
-            out = model(X_test[k*(N*N):(k+1)*(N*N),:]).cpu().data.numpy();
-            
-            pred = (out[:,2] + 2*zeta*out[:,0])*1 + \
-                   (out[:,3] + 2*zeta*out[:,1])*y_test[k*(N*N):(k+1)*(N*N),0] + \
-                   out[:,4]*y_test[k*(N*N):(k+1)*(N*N),3]
-            rmse_st[k,0] = np.mean((ST[k,0,:,:].flatten() - pred.flatten())**2)/np.mean(ST[k,0,:,:].flatten()**2)
-            
-            pred = (out[:,2] + 2*zeta*out[:,0])*0 + \
-                   (out[:,3] + 2*zeta*out[:,1])*y_test[k*(N*N):(k+1)*(N*N),1] + \
-                   out[:,4]*y_test[k*(N*N):(k+1)*(N*N),4]
-            rmse_st[k,1] = np.mean((ST[k,1,:,:].flatten() - pred.flatten())**2)/np.mean(ST[k,1,:,:].flatten()**2)
-            
-            pred = (out[:,2] + 2*zeta*out[:,0])*1 + \
-                   (out[:,3] + 2*zeta*out[:,1])*y_test[k*(N*N):(k+1)*(N*N),2] + \
-                   out[:,4]*y_test[k*(N*N):(k+1)*(N*N),5]
-            rmse_st[k,2] = np.mean((ST[k,2,:,:].flatten() - pred.flatten())**2)/np.mean(ST[k,2,:,:].flatten()**2)
+            rmse_st[k,0] = np.mean((ST[k,0,:,:].flatten() - recon_st11[k,:,:].flatten())**2)/np.mean(ST[k,0,:,:].flatten()**2)
+            rmse_st[k,1] = np.mean((ST[k,1,:,:].flatten() - recon_st12[k,:,:].flatten())**2)/np.mean(ST[k,1,:,:].flatten()**2)
+            rmse_st[k,2] = np.mean((ST[k,2,:,:].flatten() - recon_st22[k,:,:].flatten())**2)/np.mean(ST[k,2,:,:].flatten()**2)
             
         return rmse_st
 
-def generate_loader(L, zeta, load_seed, snaps, batch_s, num_batch):
-    print(" snaps used for training ", snaps)
+def add_snaps(snaps, test_):
+    count = 0; arr_ = np.argsort(test_)[::-1];
+    for i in range(0, test_.shape[0]):
+        if( (snaps.tolist().count(arr_[i]) == 0) and count < n_samples):
+            snaps = np.hstack([snaps, arr_[i]])
+            count = count + 1
+        elif(count>=n_samples):
+            return snaps;
+        else:
+            continue
     
+def generate_snaps(list_, n_snaps, seed):
+    
+    print(" length of list_ ", len(list_))
+    
+    np.random.seed(seed);
+    temp  = np.arange(0, len(list_));
+    np.random.shuffle(temp);
+    ind = temp[0:n_snaps];
+    snaps = list_[ind];
+    print(" removing... ", snaps)
+    list_ = np.asarray([i for i in list_ if i not in list_[ind]])
+    
+    return snaps, list_
+    
+def generate_loader(L, zeta, load_seed, snaps, batch_s):
+    print(" snaps used for training ", snaps)
+                   
     data = loadmat('reference_data_L_' + str(L) + '_zeta_'+ str(zeta)+'_seed'+str(load_seed)+ '_.mat')
     D    = data["D"][:,:,:,snaps]; DD   = data["DD"][:,:,:,snaps]; 
     SD   = data["SD"][:,:,:,snaps]; EE   = data["EE"][:,:,:,snaps]; 
@@ -189,48 +194,35 @@ def generate_loader(L, zeta, load_seed, snaps, batch_s, num_batch):
     trace_EE = EE[:,0,:,:] + EE[:,2,:,:];
     trace_DE =  D[:,0,:,:]*E[:,0,:,:] + 2*D[:,1,:,:]*E[:,1,:,:] + D[:,2,:,:]*E[:,2,:,:]
     
-    d11 = D[:,0,:,:].ravel();    d12 = D[:,1,:,:].ravel();   d22 = D[:,2,:,:].ravel();
-    e11 = E[:,0,:,:].ravel();    e12 = E[:,1,:,:].ravel();   e22 = E[:,2,:,:].ravel();
+    trace_DD = trace_DD.reshape(len(snaps),1,N,N)
+    trace_EE = trace_EE.reshape(len(snaps),1,N,N)
+    trace_DE = trace_DE.reshape(len(snaps),1,N,N)
     
-    ST  = SE + 2*zeta*SD
-    se11 = SE[:,0,:,:].ravel(); se12 = SE[:,1,:,:].ravel(); se22 = SE[:,2,:,:].ravel();
-    st11 = ST[:,0,:,:].ravel(); st12 = ST[:,1,:,:].ravel(); st22 = ST[:,2,:,:].ravel();
+    X_train = torch.tensor(np.hstack([trace_DD, trace_EE, trace_DE]), dtype=torch.float32)
+    ST      = SE + 2*zeta*SD
+    y_train = torch.tensor(np.hstack([D, E, ST]), dtype=torch.float32)
+    print('X_train', X_train.shape, y_train.shape) 
 
-    X = np.vstack([trace_DD.ravel(), trace_EE.ravel(), trace_DE.ravel()]).T
-    Y = np.vstack([d11, d12, d22, e11, e12, e22, st11, st12, st22]).T 
-    
-    print(" X shape ", X.shape, " Y shape ", Y.shape, " X[:,0] shape ", X[:,0].shape)
-
-    np.random.seed(load_seed)
-    torch.manual_seed(load_seed)
-
-    idxs = np.random.choice(X[:,0].size, num_batch*batch_s, replace=False)
-    X_train = torch.tensor(X[idxs], dtype=torch.float32, device=device)
-    y_train = torch.tensor(Y[idxs], dtype=torch.float32, device=device)
-    
-    print(" X_train shape ", X_train.shape, " y_train ", y_train.shape)
-
-    # setup data loaders
-    loader       = FastTensorDataLoader(X_train, y_train, batch_size=batch_s, shuffle=True)
+    loader  = FastTensorDataLoader(X_train, y_train, batch_size=batch_s, shuffle=True)
     print(" number of batches ", len(loader))
-
+    
     return loader
 
 load_seed = int(sys.argv[3])
-n_samples = int(sys.argv[4]);
-batch_s   = 16384;
-num_batch = int((N**2)*n_samples/batch_s)
-print(" num_batches ", num_batch)
+batch_s = 10; n_samples = 10;
 
 #####################################################
 snaps = np.arange(0,n_samples)
-loader  = generate_loader(L, zeta, load_seed, snaps, batch_s, num_batch)
+loader  = generate_loader(L, zeta, load_seed, snaps, batch_s)
 print(" snaps ", snaps)
 ####################################################
 
-model = DNN(sizes=[3,50,50,50,50,50,5],seed=0, activation=Sin()).to(device)
+Ninp = 3; Nout = 5; width = 2; modes = 16; # 4, 18
+model = FNO2d(Ninp, Nout, modes, width).to(device) # width, modes
 print("#parameters:", sum(p.numel() for p in model.parameters() if p.requires_grad))
-#model = model.double()
+# model = model.double();
+print(model)
+#net = net.double()
 print(model)
 
 # specify loss function
@@ -244,11 +236,8 @@ scheduler = MultiStepLR(optimizer, milestones[0], gamma=0.1)
 
 n_epochs = 10_001;
 model_ft  = train_model(zeta, model, criterion, optimizer, scheduler, n_epochs, batch_s, loader, scheduler_flag=True)  
-rmse_st   = evaluate_STCNN(model_ft, device, L, zeta, load_seed, full=False);
+rmse_st   = evaluate_STFNO(model_ft, device, L, zeta, load_seed, full=False);
 test_ = np.mean(rmse_st,axis=1)
 print(" test_ ", test_, " aggregated ", np.mean(test_))
 print(" max ind ", np.argsort(test_)[::-1][0:5])
-
-
-
 
